@@ -238,7 +238,7 @@ function App() {
       youtubePlayerRef.current.destroy();
       youtubePlayerRef.current = null;
     }
-  }, [stopYouTubeTimeUpdate]);
+  }, []);
 
   const onYouTubePlayerReady = (event: YTPlayerEvent) => {
     const player = event.target;
