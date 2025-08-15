@@ -152,7 +152,7 @@ export function VideoPlayer() {
                 volume={settings.volume}
                 playbackRate={settings.rate}
                 onProgress={handleProgress}
-                onDuration={handleDuration}
+                onDurationChange={handleDuration}
                 controls={false}
               />
             </div>
