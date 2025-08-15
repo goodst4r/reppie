@@ -660,7 +660,7 @@ function App() {
       {/* Header */}
       <header className={`${panelBgClass} ${borderClass} border-b p-4`}>
         <div className="max-w-6xl mx-auto flex items-center justify-between">
-          <h1 className="text-2xl font-bold text-blue-400">AB Repeat Player</h1>
+          <h1 className="text-2xl font-bold text-blue-400">reppie</h1>
           <div className="flex items-center space-x-4">
             <button
               onClick={toggleTheme}

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an AB Repeat Video Player built with React, TypeScript, and Vite. It's a web application that allows users to loop specific sections of videos by setting A and B points for language learning, music practice, or repeated viewing of video segments.
+This is reppie, an AB Repeat Video Player built with React, TypeScript, and Vite. It's a web application that allows users to loop specific sections of videos by setting A and B points for language learning, music practice, or repeated viewing of video segments.
 
 ## Development Commands
 
