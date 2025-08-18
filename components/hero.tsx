@@ -6,9 +6,11 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
 import { Play, Repeat, Globe } from "lucide-react"
-import { useState } from "react"
+import { useState, Suspense } from "react"
 import { useRouter } from "next/navigation"
 import Link from "next/link"
+
+import { VideoPlayer } from "@/components/video-player"
 
 interface HeroProps {
   locale?: "en" | "ja"
@@ -45,35 +47,28 @@ const content = {
 
 export function Hero({ locale = "en" }: HeroProps) {
   const [url, setUrl] = useState("")
-  const router = useRouter()
   const t = content[locale]
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault()
-    if (url.trim()) {
-      router.push(`/player?src=${encodeURIComponent(url.trim())}`)
-    }
-  }
-
   return (
-    <section className="relative min-h-screen flex items-center justify-center bg-gradient-to-br from-background to-muted px-4">
-      <div className="absolute top-4 right-4">
-        <Link href={locale === "en" ? "/jp" : "/"}>
-          <Button variant="outline" size="sm" className="gap-2 bg-transparent">
-            <Globe className="h-4 w-4" />
-            {locale === "en" ? "日本語" : "English"}
-          </Button>
-        </Link>
-      </div>
-
-      <div className="max-w-4xl mx-auto text-center space-y-8">
-        <div className="space-y-4">
-          <h1 className="text-4xl md:text-6xl font-bold text-foreground leading-tight">{t.title}</h1>
-          <p className="text-lg md:text-xl text-muted-foreground max-w-2xl mx-auto leading-relaxed">{t.subtitle}</p>
+    <div className="min-h-screen bg-background">
+      {/* Header Section */}
+      <section className="relative bg-gradient-to-br from-background to-muted px-4 py-12">
+        <div className="absolute top-4 right-4">
+          <Link href={locale === "en" ? "/jp" : "/"}>
+            <Button variant="outline" size="sm" className="gap-2 bg-transparent">
+              <Globe className="h-4 w-4" />
+              {locale === "en" ? "日本語" : "English"}
+            </Button>
+          </Link>
         </div>
 
-        <Card className="p-6 max-w-2xl mx-auto">
-          <form onSubmit={handleSubmit} className="space-y-4">
+        <div className="max-w-4xl mx-auto text-center space-y-6">
+          <div className="space-y-4">
+            <h1 className="text-3xl md:text-5xl font-bold text-foreground leading-tight">{t.title}</h1>
+            <p className="text-base md:text-lg text-muted-foreground max-w-2xl mx-auto leading-relaxed">{t.subtitle}</p>
+          </div>
+
+          <Card className="p-4 max-w-2xl mx-auto">
             <div className="flex gap-2">
               <Input
                 type="url"
@@ -82,23 +77,29 @@ export function Hero({ locale = "en" }: HeroProps) {
                 onChange={(e) => setUrl(e.target.value)}
                 className="flex-1 text-base"
               />
-              <Button type="submit" size="lg" className="gap-2 px-6">
-                <Play className="h-4 w-4" />
-                {t.button}
+              <Button onClick={() => setUrl("")} variant="outline">
+                Clear
               </Button>
             </div>
-          </form>
-        </Card>
+          </Card>
 
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 max-w-2xl mx-auto">
-          {t.features.map((feature, index) => (
-            <div key={index} className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Repeat className="h-4 w-4 text-accent" />
-              {feature}
-            </div>
-          ))}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 max-w-2xl mx-auto">
+            {t.features.map((feature, index) => (
+              <div key={index} className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Repeat className="h-4 w-4 text-accent" />
+                {feature}
+              </div>
+            ))}
+          </div>
         </div>
-      </div>
-    </section>
+      </section>
+
+      {/* Video Player Section */}
+      <section className="py-6">
+        <Suspense fallback={<div className="flex items-center justify-center min-h-[50vh]">Loading...</div>}>
+          <VideoPlayer initialUrl={url} />
+        </Suspense>
+      </section>
+    </div>
   )
 }

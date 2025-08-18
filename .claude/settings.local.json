@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__mcp-router__check_onboarding_performed",
+      "mcp__mcp-router__onboarding",
+      "mcp__mcp-router__list_dir",
+      "mcp__mcp-router__write_memory",
+      "mcp__mcp-router__activate_project",
+      "mcp__mcp-router__replace_symbol_body",
+      "mcp__MCP_DOCKER__sequentialthinking",
+      "mcp__MCP_DOCKER__browser_navigate",
+      "mcp__MCP_DOCKER__list_directory",
+      "mcp__mcp-router__find_file",
+      "mcp__playwright__browser_navigate",
+      "mcp__mcp-router__find_symbol",
+      "mcp__mcp-router__search_for_pattern",
+      "mcp__MCP_DOCKER__resolve-library-id",
+      "mcp__MCP_DOCKER__get-library-docs",
+      "mcp__playwright__browser_type",
+      "mcp__playwright__browser_snapshot",
+      "mcp__playwright__browser_console_messages",
+      "mcp__playwright__browser_press_key",
+      "mcp__playwright__browser_evaluate",
+      "mcp__playwright__browser_click",
+      "mcp__playwright__browser_wait_for",
+      "mcp__playwright__browser_take_screenshot",
+      "mcp__mcp-router__get_symbols_overview",
+      "mcp__mcp-router__think_about_task_adherence"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
