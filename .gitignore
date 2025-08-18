@@ -30,5 +30,7 @@ pnpm-debug.log*
 # Turborepo
 .turbo
 
-# .serena
+# Claude Code & Development Tools
+.claude/
 .serena/
+.playwright-mcp/
