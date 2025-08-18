@@ -6,6 +6,7 @@ import dynamic from "next/dynamic"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Slider } from "@/components/ui/slider"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Play, Pause, RotateCcw, Share2, Repeat } from "lucide-react"
 
 const ReactPlayer = dynamic(() => import("react-player/lazy"), { ssr: false })
@@ -526,15 +527,24 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                   <div className="space-y-4">
                     <div className="grid grid-cols-2 gap-4">
                       <div className="space-y-2">
-                        <label className="text-sm font-medium">Speed: {settings.rate}x</label>
-                        <Slider
-                          value={[settings.rate]}
-                          onValueChange={([value]) => setSettings((prev) => ({ ...prev, rate: value }))}
-                          min={0.25}
-                          max={2}
-                          step={0.05}
-                          className="w-full"
-                        />
+                        <label className="text-sm font-medium">Speed</label>
+                        <Select
+                          value={settings.rate.toString()}
+                          onValueChange={(value) => setSettings((prev) => ({ ...prev, rate: parseFloat(value) }))}
+                        >
+                          <SelectTrigger>
+                            <SelectValue placeholder="Speed" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="0.25">0.25x</SelectItem>
+                            <SelectItem value="0.5">0.5x</SelectItem>
+                            <SelectItem value="0.75">0.75x</SelectItem>
+                            <SelectItem value="1">1x</SelectItem>
+                            <SelectItem value="1.25">1.25x</SelectItem>
+                            <SelectItem value="1.5">1.5x</SelectItem>
+                            <SelectItem value="2">2x</SelectItem>
+                          </SelectContent>
+                        </Select>
                       </div>
                       <div className="space-y-2">
                         <label className="text-sm font-medium">Volume: {Math.round(settings.volume * 100)}%</label>
