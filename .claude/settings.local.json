@@ -25,7 +25,15 @@
       "mcp__playwright__browser_wait_for",
       "mcp__playwright__browser_take_screenshot",
       "mcp__mcp-router__get_symbols_overview",
-      "mcp__mcp-router__think_about_task_adherence"
+      "mcp__mcp-router__think_about_task_adherence",
+      "mcp__MCP_DOCKER__read_file",
+      "mcp__MCP_DOCKER__edit_block",
+      "Bash(grep:*)",
+      "Bash(npm run lint)",
+      "Bash(npm run build:*)",
+      "Bash(npm install:*)",
+      "Bash(sed:*)",
+      "mcp__playwright__browser_close"
     ],
     "deny": [],
     "ask": []

@@ -2,12 +2,13 @@
 
 import { useState, useEffect, useRef, useCallback } from "react"
 import { useSearchParams } from "next/navigation"
-import ReactPlayer from "react-player/lib"
+import dynamic from "next/dynamic"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Slider } from "@/components/ui/slider"
-import { Badge } from "@/components/ui/badge"
-import { Play, Pause, RotateCcw, Share2, ArrowLeft, ArrowRight, Repeat } from "lucide-react"
+import { Play, Pause, RotateCcw, Share2, Repeat } from "lucide-react"
+
+const ReactPlayer = dynamic(() => import("react-player/lazy"), { ssr: false })
 
 interface ABSettings {
   a?: number
@@ -29,12 +30,25 @@ interface PlayerError {
 
 // Dailymotion utility functions
 const isDailymotionUrl = (url: string): boolean => {
-  return /dailymotion\.com\/video\//.test(url)
+  return /dailymotion\.com\/video\//.test(url) || /dai\.ly\//.test(url)
 }
 
 const extractDailymotionVideoId = (url: string): string | null => {
-  const match = url.match(/dailymotion\.com\/video\/([^?&]+)/)
-  return match ? match[1] : null
+  // dai.ly short format
+  const shortMatch = url.match(/dai\.ly\/([^?&]+)/)
+  if (shortMatch) return shortMatch[1]
+  
+  // Standard dailymotion.com format
+  const standardMatch = url.match(/dailymotion\.com\/video\/([^?&]+)/)
+  return standardMatch ? standardMatch[1] : null
+}
+
+const normalizeDailymotionUrl = (url: string): string => {
+  const videoId = extractDailymotionVideoId(url)
+  if (!videoId) return url
+  
+  // Always return the standard format for ReactPlayer
+  return `https://www.dailymotion.com/video/${videoId}`
 }
 
 export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
@@ -54,16 +68,35 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
     volume: 0.8,
   })
   const [isDragging, setIsDragging] = useState(false)
-  const [dragTarget, setDragTarget] = useState<'progress' | 'a' | 'b' | null>(null)
+  const [dragTarget, setDragTarget] = useState<'a' | 'b' | null>(null)
 
   // Update URL when initialUrl changes (realtime reflection)
   useEffect(() => {
     if (initialUrl !== undefined) {
-      setUrl(initialUrl)
+      const normalizedUrl = isDailymotionUrl(initialUrl) 
+        ? normalizeDailymotionUrl(initialUrl) 
+        : initialUrl
+      setUrl(normalizedUrl)
       setError(null)
       setIsReady(false)
     }
   }, [initialUrl])
+
+  // Loading timeout to prevent infinite loading
+  useEffect(() => {
+    if (url && isValidUrl(url) && !isReady && !error) {
+      const timeout = setTimeout(() => {
+        if (!isReady && !error) {
+          setError({
+            message: '動画の読み込みがタイムアウトしました。URLを確認してください。',
+            type: 'timeout_error'
+          })
+        }
+      }, 15000)
+
+      return () => clearTimeout(timeout)
+    }
+  }, [url, isReady, error])
 
   // Initialize from URL params (for direct /player page access)
   useEffect(() => {
@@ -74,7 +107,10 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
     const rate = searchParams.get("rate")
 
     if (src && !initialUrl) {
-      setUrl(src)
+      const normalizedUrl = isDailymotionUrl(src) 
+        ? normalizeDailymotionUrl(src) 
+        : src
+      setUrl(normalizedUrl)
       setError(null)
       setIsReady(false)
     }
@@ -89,11 +125,12 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
     }
   }, [searchParams, initialUrl])
 
+
   // AB Loop logic
   useEffect(() => {
     if (settings.loopMode !== "off" && settings.a !== undefined && settings.b !== undefined) {
       if (currentTime >= settings.b) {
-        playerRef.current?.seekTo(settings.a)
+        playerRef.current?.seekTo(settings.a, "seconds")
       }
     }
   }, [currentTime, settings])
@@ -128,26 +165,81 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
   }, [currentTime])
 
   const handleProgress = useCallback((state: { playedSeconds: number }) => {
-    setCurrentTime(state.playedSeconds)
-  }, [])
+    if (!isDragging) setCurrentTime(state.playedSeconds)
+  }, [isDragging])
 
   const handleDuration = useCallback((duration: number) => {
     setDuration(duration)
-  }, [])
+  }, [url])
 
   const handleReady = useCallback(() => {
     setIsReady(true)
     setError(null)
-  }, [])
+    setPlaying(false)
 
-  const handleError = useCallback((error: any) => {
+    // YouTube の 0秒問題対策: ready後に getDuration を再取得
+    const trySet = () => {
+      const d = playerRef.current?.getDuration?.()
+      if (typeof d === 'number' && isFinite(d) && d > 0) {
+        setDuration(d)
+        return true
+      }
+      return false
+    }
+
+    if (!trySet()) {
+      const id = setInterval(() => {
+        if (trySet()) clearInterval(id)
+      }, 250)
+      setTimeout(() => clearInterval(id), 3000)
+    }
+  }, [url])
+
+  const handleError = useCallback((error: unknown) => {
+    // 完全に空のオブジェクトのみスキップ
+    if (!error || (typeof error === 'object' && Object.keys(error).length === 0)) {
+      return
+    }
+
     console.error('ReactPlayer error:', error)
+    
+    // HTML5 ErrorイベントからMediaErrorの詳細を取得
+    let errorMessage = 'ビデオの読み込みに失敗しました。'
+    
+    if (error.target && error.target.error) {
+      const mediaError = error.target.error
+      switch (mediaError.code) {
+        case 1: // MEDIA_ERR_ABORTED
+          errorMessage = '動画の読み込みが中断されました。'
+          break
+        case 2: // MEDIA_ERR_NETWORK
+          errorMessage = 'ネットワークエラーです。接続を確認してください。'
+          break
+        case 3: // MEDIA_ERR_DECODE
+          errorMessage = '動画の形式が破損しています。'
+          break
+        case 4: // MEDIA_ERR_SRC_NOT_SUPPORTED
+          // Dailymotion特有のエラーメッセージ
+          if (isDailymotionUrl(url)) {
+            errorMessage = 'Dailymotion動画が読み込めません。埋め込み許可されていない可能性があります。'
+          } else {
+            errorMessage = 'この動画形式はサポートされていません。'
+          }
+          break
+        default:
+          errorMessage = 'URLが正しいか確認してください。'
+      }
+    } else if (isDailymotionUrl(url)) {
+      // Dailymotion特有の問題
+      errorMessage = 'Dailymotion動画にアクセスできません。URL形式を確認するか、別の動画をお試しください。'
+    }
+    
     setError({
-      message: 'ビデオの読み込みに失敗しました。URLが正しいか確認してください。',
+      message: errorMessage,
       type: 'loading_error'
     })
     setIsReady(false)
-  }, [])
+  }, [url])
 
   const isValidUrl = (url: string) => {
     if (!url) return false
@@ -177,13 +269,12 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
     navigator.clipboard.writeText(shareUrl)
   }
 
+
   const handleProgressBarClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!duration) return
     const rect = e.currentTarget.getBoundingClientRect()
-    const clickX = e.clientX - rect.left
-    const percentage = clickX / rect.width
-    const newTime = percentage * duration
-    playerRef.current?.seekTo(newTime)
+    const newTime = ((e.clientX - rect.left) / rect.width) * duration
+    playerRef.current?.seekTo(newTime, "seconds")
   }
 
   const handleMarkerDrag = (e: React.MouseEvent<HTMLDivElement>, marker: 'a' | 'b') => {
@@ -243,47 +334,17 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                     </Button>
                   </div>
                 </div>
-              ) : isDailymotionUrl(url) ? (
-                <div className="relative">
-                  <iframe
-                    src={`https://www.dailymotion.com/embed/video/${extractDailymotionVideoId(url)}`}
-                    width="100%"
-                    height="315"
-                    frameBorder="0"
-                    allowFullScreen
-                    allow="autoplay; fullscreen; picture-in-picture"
-                    style={{ aspectRatio: "16/9", borderRadius: "8px" }}
-                    onLoad={() => {
-                      setIsReady(true)
-                      setError(null)
-                    }}
-                    onError={() => {
-                      setError({
-                        message: 'Dailymotion動画の読み込みに失敗しました。URLが正しいか確認してください。',
-                        type: 'dailymotion_error'
-                      })
-                      setIsReady(false)
-                    }}
-                  />
-                  {!isReady && (
-                    <div className="absolute inset-0 flex items-center justify-center bg-muted rounded-lg">
-                      <div className="text-center text-muted-foreground">
-                        <Play className="h-8 w-8 mx-auto opacity-50 mb-2 animate-pulse" />
-                        <p className="text-sm">Dailymotion動画を読み込み中...</p>
-                      </div>
-                    </div>
-                  )}
-                </div>
               ) : (
                 <div className="relative">
                   <ReactPlayer
+                    key={url}
                     ref={playerRef}
                     url={url}
                     playing={playing}
                     volume={settings.volume}
                     playbackRate={settings.rate}
                     onProgress={handleProgress}
-                    onDurationChange={handleDuration}
+                    onDuration={handleDuration}
                     onReady={handleReady}
                     onError={handleError}
                     controls={false}
@@ -295,6 +356,22 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                         playerVars: {
                           showinfo: 1,
                           origin: typeof window !== 'undefined' ? window.location.origin : undefined
+                        }
+                      },
+                      dailymotion: {
+                        params: {
+                          autoplay: false,
+                          mute: false,
+                          'queue-enable': false,
+                          'sharing-enable': false,
+                          'ui-highlight': '00aaff',
+                          'ui-logo': false,
+                          'ui-start-screen-info': false,
+                        }
+                      },
+                      vimeo: {
+                        playerOptions: {
+                          autoplay: false
                         }
                       }
                     }}
@@ -309,8 +386,11 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                   )}
                 </div>
               )}
+            </div>
 
-              {/* Custom Progress Bar */}
+            {/* Right Column - Controls and Instructions */}
+            <div className="space-y-4">
+              {/* Video Controls Panel */}
               <Card>
                 <CardContent className="p-4 space-y-4">
                   {/* Progress Bar with A/B Markers */}
@@ -485,10 +565,8 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                   </div>
                 </CardContent>
               </Card>
-            </div>
 
-            {/* Right Column - Instructions */}
-            <div className="space-y-4">
+              {/* AB Repeat Instructions */}
               <Card>
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
