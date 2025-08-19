@@ -80,6 +80,9 @@ const DailymotionABPlayer = ({
   const containerRef = useRef<HTMLDivElement | null>(null)
   const playerRef = useRef<unknown>(null)
   const inAdRef = useRef(false)
+  
+  // 安定したID文字列を生成（#なし）
+  const containerIdRef = useRef(`dailymotion-player-${Math.random().toString(36).slice(2)}`)
 
   useEffect(() => {
     if (!videoId) return
@@ -89,7 +92,7 @@ const DailymotionABPlayer = ({
 
     const ensurePlayer = () => {
       const dm = (window as { dailymotion?: unknown }).dailymotion as {
-        createPlayer: (containerSelector: string, config: {
+        createPlayer: (containerId: string, config: {
           video: string;
           params: Record<string, unknown>;
         }) => Promise<{
@@ -102,13 +105,9 @@ const DailymotionABPlayer = ({
       }
       if (!dm || !containerRef.current) return
 
-      // コンテナにIDを設定してセレクタで指定
-      const containerId = `dailymotion-player-${videoId}`
-      if (containerRef.current) {
-        containerRef.current.id = containerId
-      }
-
-      dm.createPlayer(`#${containerId}`, {
+      // createPlayerには#なしのID文字列を渡す（SDKが内部で#を付ける）
+      const containerId = containerIdRef.current
+      dm.createPlayer(containerId, {
         video: videoId,
         params: { 
           startTime: 0, 
@@ -208,6 +207,7 @@ const DailymotionABPlayer = ({
     <div className="relative">
       <div
         ref={containerRef}
+        id={containerIdRef.current}
         className="w-full aspect-video bg-black rounded-lg overflow-hidden"
       />
       <div className="absolute top-2 left-2 bg-blue-600 text-white text-xs px-2 py-1 rounded">
