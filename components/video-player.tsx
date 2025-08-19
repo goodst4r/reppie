@@ -55,11 +55,171 @@ const normalizeDailymotionUrl = (url: string): string => {
   return `https://www.dailymotion.com/video/${videoId}`
 }
 
+// Dailymotion専用ABリピートコンポーネント
+interface DailymotionABPlayerProps {
+  videoId: string
+  playerId?: string
+  settings: ABSettings
+  onSettingsChange: (settings: Partial<ABSettings>) => void
+  onProgress: (time: number) => void
+  onDuration: (duration: number) => void
+  onReady: () => void
+  onError: (error: unknown) => void
+}
+
+const DailymotionABPlayer = ({ 
+  videoId, 
+  playerId = "x7z85hl", // Dailymotion公式のサンプルプレーヤーID
+  settings,
+  onSettingsChange,
+  onProgress,
+  onDuration,
+  onReady,
+  onError
+}: DailymotionABPlayerProps) => {
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const playerRef = useRef<unknown>(null)
+  const inAdRef = useRef(false)
+
+  useEffect(() => {
+    if (!videoId) return
+
+    const sdkSrc = `https://geo.dailymotion.com/libs/player/${playerId}.js`
+    const existing = document.querySelector(`script[src="${sdkSrc}"]`)
+
+    const ensurePlayer = () => {
+      const dm = (window as { dailymotion?: unknown }).dailymotion as {
+        createPlayer: (container: HTMLElement, config: {
+          video: string;
+          params: Record<string, unknown>;
+        }) => Promise<{
+          on: (event: string, callback: (data?: unknown) => void) => void;
+          seek: (time: number) => void;
+          getDuration: () => Promise<number>;
+          setVolume: (volume: number) => Promise<void>;
+          destroy?: () => void;
+        }>;
+      }
+      if (!dm || !containerRef.current) return
+
+      dm.createPlayer(containerRef.current, {
+        video: videoId,
+        params: { 
+          startTime: 0, 
+          loop: false,
+          autoplay: false,
+          mute: false,
+          queue: false
+        },
+      })
+      .then((p) => {
+        playerRef.current = p
+
+        // プレーヤー準備完了
+        p.on("VIDEO_START", () => {
+          onReady()
+          // durationを取得
+          p.getDuration().then((d: number) => {
+            if (d > 0) onDuration(d)
+          }).catch(console.error)
+        })
+
+        // 広告制御
+        p.on("AD_START", () => (inAdRef.current = true))
+        p.on("AD_END", () => (inAdRef.current = false))
+
+        // 時間変更イベント
+        p.on("VIDEO_TIMECHANGE", (state) => {
+          const t = (state as { videoCurrentTime?: number })?.videoCurrentTime ?? 0
+          onProgress(t)
+
+          // ABリピート制御
+          if (!inAdRef.current && settings.loopMode !== "off" && 
+              settings.a !== undefined && settings.b !== undefined) {
+            const EPS = 0.05
+            if (settings.b > settings.a + EPS && t >= settings.b - EPS) {
+              p.seek(settings.a)
+            }
+          }
+        })
+
+        // エラーハンドリング
+        p.on("ERROR", (error) => {
+          onError(error)
+        })
+
+      })
+      .catch((error) => {
+        console.error('Dailymotion player creation failed:', error)
+        onError(error)
+      })
+    }
+
+    if (existing) {
+      ensurePlayer()
+    } else {
+      const s = document.createElement("script")
+      s.src = sdkSrc
+      s.async = true
+      s.onload = ensurePlayer
+      s.onerror = () => onError(new Error('Failed to load Dailymotion SDK'))
+      document.head.appendChild(s)
+    }
+
+    return () => {
+      try {
+        const p = playerRef.current as {
+          destroy?: () => void;
+        } | null
+        if (p?.destroy) p.destroy()
+        playerRef.current = null
+      } catch {
+        // エラーを無視
+      }
+    }
+  }, [videoId, playerId, settings.a, settings.b, settings.loopMode, onReady, onDuration, onProgress, onError])
+
+  // 再生制御
+  useEffect(() => {
+    const p = playerRef.current as {
+      setVolume?: (volume: number) => Promise<void>;
+    } | null
+    if (!p) return
+
+    // ボリューム制御
+    if (typeof settings.volume === 'number' && p.setVolume) {
+      p.setVolume(settings.volume).catch(console.error)
+    }
+
+    // 再生速度制御（Dailymotionでは制限あり）
+    if (typeof settings.rate === 'number' && settings.rate !== 1) {
+      // Dailymotionは再生速度変更に制限があるため、警告のみ
+      console.warn('Dailymotion does not support playback rate control')
+    }
+  }, [settings.volume, settings.rate])
+
+  return (
+    <div className="relative">
+      <div
+        ref={containerRef}
+        className="w-full aspect-video bg-black rounded-lg overflow-hidden"
+      />
+      <div className="absolute top-2 left-2 bg-blue-600 text-white text-xs px-2 py-1 rounded">
+        Dailymotion
+      </div>
+    </div>
+  )
+}
+
 export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
   const searchParams = useSearchParams()
   const playerRef = useRef<ReactPlayer>(null)
 
   const [url, setUrl] = useState(initialUrl || "")
+  
+  // Dailymotion判定
+  const isDM = isDailymotionUrl(url)
+  const dmId = isDM ? extractDailymotionVideoId(url) : null
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
@@ -95,21 +255,6 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
     }
   }, [initialUrl])
 
-  // Loading timeout to prevent infinite loading
-  useEffect(() => {
-    if (url && isValidUrl(url) && !isReady && !error) {
-      const timeout = setTimeout(() => {
-        if (!isReady && !error) {
-          setError({
-            message: 'Video loading timed out. Please check the URL.',
-            type: 'timeout_error'
-          })
-        }
-      }, 15000)
-
-      return () => clearTimeout(timeout)
-    }
-  }, [url, isReady, error])
 
   // Initialize from URL params (for direct /player page access)
   useEffect(() => {
@@ -369,26 +514,40 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                 </div>
               ) : (
                 <div className="relative">
-                  <ReactPlayer
-                    key={url}
-                    ref={playerRef}
-                    url={url}
-                    playing={playing}
-                    volume={settings.volume}
-                    playbackRate={settings.rate}
-                    onProgress={handleProgress}
-                    onDuration={handleDuration}
-                    onReady={handleReady}
-                    onError={handleError}
-                    controls={false}
-                    width="100%"
-                    height="auto"
-                    style={{ aspectRatio: "16/9" }}
-                  />
-                  {!isReady && (
-                    <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white"></div>
-                    </div>
+                  {isDM && dmId ? (
+                    <DailymotionABPlayer
+                      videoId={dmId}
+                      settings={settings}
+                      onSettingsChange={(newSettings) => setSettings(prev => ({ ...prev, ...newSettings }))}
+                      onProgress={setCurrentTime}
+                      onDuration={handleDuration}
+                      onReady={handleReady}
+                      onError={handleError}
+                    />
+                  ) : (
+                    <>
+                      <ReactPlayer
+                        key={url}
+                        ref={playerRef}
+                        url={url}
+                        playing={playing}
+                        volume={settings.volume}
+                        playbackRate={settings.rate}
+                        onProgress={handleProgress}
+                        onDuration={handleDuration}
+                        onReady={handleReady}
+                        onError={handleError}
+                        controls={false}
+                        width="100%"
+                        height="auto"
+                        style={{ aspectRatio: "16/9" }}
+                      />
+                      {!isReady && (
+                        <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+                          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white"></div>
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               )}
