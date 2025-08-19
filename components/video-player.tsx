@@ -55,11 +55,43 @@ const normalizeDailymotionUrl = (url: string): string => {
   return `https://www.dailymotion.com/video/${videoId}`
 }
 
+// DailymotionEmbed component for iframe embedding
+interface DailymotionEmbedProps {
+  videoId: string
+  playerId?: string
+}
+
+const DailymotionEmbed = ({ videoId, playerId = "xYOUR_PLAYER_ID" }: DailymotionEmbedProps) => {
+  const [isLoaded, setIsLoaded] = useState(false)
+  
+  return (
+    <div className="relative">
+      <iframe
+        src={`https://geo.dailymotion.com/player/${playerId}.html?video=${videoId}&autoplay=0&queue-enable=0&ui-start-screen-info=0&ui-logo=0`}
+        allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
+        allowFullScreen
+        className="w-full aspect-video rounded-lg"
+        title="Dailymotion Player"
+        onLoad={() => setIsLoaded(true)}
+      />
+      {!isLoaded && (
+        <div className="absolute inset-0 bg-black/50 flex items-center justify-center rounded-lg">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white"></div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
   const searchParams = useSearchParams()
   const playerRef = useRef<ReactPlayer>(null)
 
   const [url, setUrl] = useState(initialUrl || "")
+  
+  // Dailymotionの場合の分岐用の状態
+  const isDM = isDailymotionUrl(url)
+  const dmId = isDM ? extractDailymotionVideoId(url) : null
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
@@ -346,9 +378,17 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
       <div className="max-w-7xl mx-auto space-y-6">
         {/* Video Player - Show placeholder when no URL */}
         {url && isValidUrl(url) ? (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className={`grid gap-6 ${isDM ? 'grid-cols-1' : 'grid-cols-1 lg:grid-cols-2'}`}>
             {/* Left Column - Video */}
             <div className="space-y-4">
+              {/* Dailymotion特別表示 */}
+              {isDM && dmId && (
+                <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+                  <p className="text-sm text-blue-800">
+                    <strong>Dailymotion動画:</strong> この動画はDailymotionの新しいiframeプレーヤーで表示されています。ABリピート機能は利用できませんが、動画の読み込みエラーが解消されています。
+                  </p>
+                </div>
+              )}
               {error ? (
                 <div className="flex items-center justify-center bg-muted rounded-lg" style={{ aspectRatio: "16/9" }}>
                   <div className="text-center text-muted-foreground p-8">
@@ -369,32 +409,38 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                 </div>
               ) : (
                 <div className="relative">
-                  <ReactPlayer
-                    key={url}
-                    ref={playerRef}
-                    url={url}
-                    playing={playing}
-                    volume={settings.volume}
-                    playbackRate={settings.rate}
-                    onProgress={handleProgress}
-                    onDuration={handleDuration}
-                    onReady={handleReady}
-                    onError={handleError}
-                    controls={false}
-                    width="100%"
-                    height="auto"
-                    style={{ aspectRatio: "16/9" }}
-                  />
-                  {!isReady && (
-                    <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white"></div>
-                    </div>
+                  {isDM && dmId ? (
+                    <DailymotionEmbed videoId={dmId} playerId="xYOUR_PLAYER_ID" />
+                  ) : (
+                    <>
+                      <ReactPlayer
+                        key={url}
+                        ref={playerRef}
+                        url={url}
+                        playing={playing}
+                        volume={settings.volume}
+                        playbackRate={settings.rate}
+                        onProgress={handleProgress}
+                        onDuration={handleDuration}
+                        onReady={handleReady}
+                        onError={handleError}
+                        controls={false}
+                        width="100%"
+                        height="auto"
+                        style={{ aspectRatio: "16/9" }}
+                      />
+                      {!isReady && (
+                        <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+                          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white"></div>
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               )}
 
-              {/* Custom Controls */}
-              {isReady && (
+              {/* Custom Controls - DailymotionのiframeではABコントロールは利用不可 */}
+              {isReady && !isDM && (
                 <div className="space-y-4">
                   {/* Progress Bar with AB markers */}
                   <div className="relative cursor-pointer">
@@ -512,7 +558,8 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
               )}
             </div>
 
-            {/* Right Column - Settings */}
+            {/* Right Column - Settings - DailymotionのiframeではAB設定は利用不可 */}
+            {!isDM && (
             <div className="space-y-6">
               <Card>
                 <CardHeader>
@@ -681,6 +728,7 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                 </CardContent>
               </Card>
             </div>
+            )}
           </div>
         ) : (
           <div className="flex items-center justify-center min-h-[50vh] bg-muted/30 rounded-lg">
