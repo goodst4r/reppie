@@ -33,4 +33,7 @@ pnpm-debug.log*
 # Claude Code & Development Tools
 .claude/
 .serena/
-.playwright-mcp/
+.playwright-mcp/# Ignore local settings and cache files
+.claude/settings.local.json
+.serena/cache/
+tsconfig.tsbuildinfo
