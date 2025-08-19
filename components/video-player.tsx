@@ -1,19 +1,24 @@
 "use client"
 
-import { useState, useEffect, useRef, useCallback } from "react"
+import { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import { useSearchParams } from "next/navigation"
 import dynamic from "next/dynamic"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Slider } from "@/components/ui/slider"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Label } from "@/components/ui/label"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { Input } from "@/components/ui/input"
-import { Play, Pause, RotateCcw, Share2, Repeat, Settings, Keyboard, Bookmark } from "lucide-react"
+import { Play, Pause, Share2, Repeat, Settings, Keyboard, Bookmark } from "lucide-react"
 
-const ReactPlayer = dynamic(() => import("react-player/lazy"), { ssr: false })
+const ReactPlayer = dynamic(() => import("react-player/lazy"), {
+  ssr: false,
+  loading: () => <div className="w-full aspect-video bg-black/40 rounded-lg" />,
+})
 
+/* ========================
+   共通設定/型
+======================== */
 interface ABSettings {
   a?: number
   b?: number
@@ -32,17 +37,16 @@ interface PlayerError {
   type: string
 }
 
-// Dailymotion utility functions
+/* ========================
+   Dailymotion ユーティリティ
+======================== */
 const isDailymotionUrl = (url: string): boolean => {
   return /dailymotion\.com\/video\//.test(url) || /dai\.ly\//.test(url)
 }
 
 const extractDailymotionVideoId = (url: string): string | null => {
-  // dai.ly short format
   const shortMatch = url.match(/dai\.ly\/([^?&]+)/)
   if (shortMatch) return shortMatch[1]
-  
-  // Standard dailymotion.com format
   const standardMatch = url.match(/dailymotion\.com\/video\/([^?&]+)/)
   return standardMatch ? standardMatch[1] : null
 }
@@ -50,12 +54,20 @@ const extractDailymotionVideoId = (url: string): string | null => {
 const normalizeDailymotionUrl = (url: string): string => {
   const videoId = extractDailymotionVideoId(url)
   if (!videoId) return url
-  
-  // Always return the standard format for ReactPlayer
   return `https://www.dailymotion.com/video/${videoId}`
 }
 
-// Dailymotion専用ABリピートコンポーネント
+/* ========================
+   Dailymotion AB プレイヤー（差し替え版）
+======================== */
+type DMExternalApi = {
+  seekTo: (sec: number) => void
+  play: () => void
+  pause: () => void
+  getCurrentTime: () => Promise<number>
+  getDuration: () => Promise<number>
+}
+
 interface DailymotionABPlayerProps {
   videoId: string
   playerId?: string
@@ -65,143 +77,299 @@ interface DailymotionABPlayerProps {
   onDuration: (duration: number) => void
   onReady: () => void
   onError: (error: unknown) => void
+  registerApi?: (api: DMExternalApi | null) => void
+  onLoop?: () => void
 }
 
-const DailymotionABPlayer = ({ 
-  videoId, 
-  playerId = "x7z85hl", // Dailymotion公式のサンプルプレーヤーID
+const DailymotionABPlayer = ({
+  videoId,
+  playerId = "x7z85hl",
   settings,
   onSettingsChange,
   onProgress,
   onDuration,
   onReady,
-  onError
+  onError,
+  registerApi,
+  onLoop,
 }: DailymotionABPlayerProps) => {
   const containerRef = useRef<HTMLDivElement | null>(null)
-  const playerRef = useRef<unknown>(null)
+  const playerRef = useRef<any>(null)
   const inAdRef = useRef(false)
-  
-  // 安定したID文字列を生成（#なし）
   const containerIdRef = useRef(`dailymotion-player-${Math.random().toString(36).slice(2)}`)
+
+  // 最新 settings / handlers
+  const settingsRef = useRef(settings)
+  useEffect(() => { settingsRef.current = settings }, [settings])
+
+  const handlersRef = useRef({ onSettingsChange, onProgress, onDuration, onReady, onError, onLoop })
+  useEffect(() => {
+    handlersRef.current = { onSettingsChange, onProgress, onDuration, onReady, onError, onLoop }
+  }, [onSettingsChange, onProgress, onDuration, onReady, onError, onLoop])
+
+  // 有限ループ残回数
+  const loopLeftRef = useRef<number>(settings.loopMode === "finite" ? Math.max(0, settings.loopCount) : 0)
+  useEffect(() => {
+    loopLeftRef.current = settings.loopMode === "finite" ? Math.max(0, settings.loopCount) : 0
+  }, [settings.loopMode, settings.loopCount])
+
+  // seek 直後のスパム回避
+  const lastSeekAtRef = useRef<number>(0)
+  const ignoreAfterSeekMs = 350
+
+  // Strict Mode 二重初期化ガード
+  const initializedRef = useRef(false)
+
+  // timechange が来ない環境向けのフォールバック
+  const lastEventAtRef = useRef<number>(0)
+  const rafIdRef = useRef<number | null>(null)
+  const RAF_INTERVAL_MS = 200 // 200ms 以上イベントが来なければポーリング
+
+  // 共通：時刻抽出（イベント / getState() どちらでも使う）
+  const extractTime = (state: any): number => {
+    if (state == null) return 0
+    if (typeof state === "number" && isFinite(state)) return state
+    // 代表的なキーを広くサポート
+    return (
+      Number(state.videoCurrentTime) ||
+      Number(state.currentTime) ||
+      Number(state.time) ||
+      0
+    )
+  }
+
+  // 共通：AB判定＆シーク
+  const maybeLoop = useCallback((t: number, p: any) => {
+    const A = settingsRef.current.a
+    const B = settingsRef.current.b
+    if (inAdRef.current || settingsRef.current.loopMode === "off" || A == null || B == null) return
+
+    if (performance.now() - lastSeekAtRef.current < ignoreAfterSeekMs) return
+
+    const EPS = 0.05
+    if (B > A + EPS && t >= B - EPS) {
+      if (settingsRef.current.loopMode === "infinite") {
+        lastSeekAtRef.current = performance.now()
+        p.seek(A)
+        p.play?.()
+        handlersRef.current.onLoop?.()
+      } else if (settingsRef.current.loopMode === "finite") {
+        if (loopLeftRef.current > 1) {
+          loopLeftRef.current -= 1
+          lastSeekAtRef.current = performance.now()
+          p.seek(A)
+          p.play?.()
+          handlersRef.current.onLoop?.()
+        } else {
+          handlersRef.current.onSettingsChange?.({ loopMode: "off", loopCount: 0 })
+        }
+      }
+    }
+  }, [])
+
+  // RAF フォールバック
+  const startRaf = useCallback(() => {
+    if (rafIdRef.current != null) return
+    const tick = async () => {
+      rafIdRef.current = requestAnimationFrame(tick)
+      if (!playerRef.current) return
+      // 直近の timechange から一定時間以上たっている場合のみチェック
+      if (performance.now() - lastEventAtRef.current < RAF_INTERVAL_MS) return
+      try {
+        const s = await playerRef.current.getState?.()
+        const t = extractTime(s)
+        handlersRef.current.onProgress?.(t)
+        maybeLoop(t, playerRef.current)
+      } catch {}
+    }
+    rafIdRef.current = requestAnimationFrame(tick)
+  }, [maybeLoop])
+
+  const stopRaf = useCallback(() => {
+    if (rafIdRef.current != null) {
+      cancelAnimationFrame(rafIdRef.current)
+      rafIdRef.current = null
+    }
+  }, [])
 
   useEffect(() => {
     if (!videoId) return
+    if (initializedRef.current) return
+    initializedRef.current = true
 
     const sdkSrc = `https://geo.dailymotion.com/libs/player/${playerId}.js`
-    const existing = document.querySelector(`script[src="${sdkSrc}"]`)
+    const existing = document.querySelector(`script[src="${sdkSrc}"]`) as HTMLScriptElement | null
+
+    if (playerRef.current) return
+
+    // CSPヒント（任意）
+    try {
+      const metaCsp = document.querySelector('meta[http-equiv="Content-Security-Policy"]')
+      if (metaCsp && !metaCsp.getAttribute("content")?.includes("dailymotion.com")) {
+        console.warn("CSP may block Dailymotion iframe. Consider updating CSP headers.")
+      }
+    } catch {}
 
     const ensurePlayer = () => {
-      const dm = (window as { dailymotion?: unknown }).dailymotion as {
-        createPlayer: (containerId: string, config: {
-          video: string;
-          params: Record<string, unknown>;
-        }) => Promise<{
-          on: (event: string, callback: (data?: unknown) => void) => void;
-          seek: (time: number) => void;
-          getDuration: () => Promise<number>;
-          setVolume: (volume: number) => Promise<void>;
-          destroy?: () => void;
-        }>;
+      if (playerRef.current) return
+      const dm = (window as any).dailymotion as {
+        createPlayer: (
+          containerId: string,
+          config: { video: string; params: Record<string, unknown> }
+        ) => Promise<{
+          on: (event: string, callback: (data?: any) => void) => void
+          seek: (time: number) => void
+          play?: () => void
+          pause?: () => void
+          getState?: () => Promise<{ videoCurrentTime?: number; videoDuration?: number }>
+          setVolume?: (volume: number) => Promise<void>
+          destroy?: () => void
+        }>
       }
-      if (!dm || !containerRef.current) return
+      if (!dm || !containerRef.current) {
+        console.warn("Dailymotion SDK not loaded or container not ready")
+        return
+      }
 
-      // createPlayerには#なしのID文字列を渡す（SDKが内部で#を付ける）
-      const containerId = containerIdRef.current
-      dm.createPlayer(containerId, {
+      dm.createPlayer(containerIdRef.current, {
         video: videoId,
-        params: { 
-          startTime: 0, 
+        params: {
+          startTime: 0,
           loop: false,
           autoplay: false,
           mute: false,
-          queue: false
+          queue: false,
+          "ui-embed-sandbox": "allow-scripts allow-same-origin allow-popups allow-forms",
+          "iframe-sandbox": "allow-scripts allow-same-origin allow-popups allow-forms",
         },
       })
-      .then((p) => {
-        playerRef.current = p
+        .then((p) => {
+          playerRef.current = p
 
-        // プレーヤー準備完了
-        p.on("VIDEO_START", () => {
-          onReady()
-          // durationを取得
-          p.getDuration().then((d: number) => {
-            if (d > 0) onDuration(d)
-          }).catch(console.error)
-        })
-
-        // 広告制御
-        p.on("AD_START", () => (inAdRef.current = true))
-        p.on("AD_END", () => (inAdRef.current = false))
-
-        // 時間変更イベント
-        p.on("VIDEO_TIMECHANGE", (state) => {
-          const t = (state as { videoCurrentTime?: number })?.videoCurrentTime ?? 0
-          onProgress(t)
-
-          // ABリピート制御
-          if (!inAdRef.current && settings.loopMode !== "off" && 
-              settings.a !== undefined && settings.b !== undefined) {
-            const EPS = 0.05
-            if (settings.b > settings.a + EPS && t >= settings.b - EPS) {
-              p.seek(settings.a)
-            }
+          // noisy warn を抑制（cleanupで戻す）
+          const originalConsoleWarn = console.warn
+          console.warn = (...args) => {
+            const msg = args.join(" ")
+            if (
+              msg.includes("Unknown event") ||
+              msg.includes("isEligibleForPipDisplay") ||
+              msg.includes("https://geo.dailymotion.com/libs/player/")
+            ) return
+            originalConsoleWarn.apply(console, args as any)
           }
-        })
+          const cleanupWarn = () => { console.warn = originalConsoleWarn }
 
-        // エラーハンドリング
-        p.on("ERROR", (error) => {
-          onError(error)
-        })
+          handlersRef.current.onReady?.()
 
-      })
-      .catch((error) => {
-        console.error('Dailymotion player creation failed:', error)
-        onError(error)
-      })
+          // 初期 duration
+          p.getState?.()
+            .then((s) => {
+              const d = Number((s as any)?.videoDuration) || 0
+              if (d > 0) handlersRef.current.onDuration?.(d)
+            })
+            .catch(() => {})
+
+          // 外部制御API
+          registerApi?.({
+            seekTo: (sec) => { lastSeekAtRef.current = performance.now(); p.seek(sec) },
+            play: () => p.play?.(),
+            pause: () => p.pause?.(),
+            getCurrentTime: async () => {
+              const s = await p.getState?.()
+              return extractTime(s)
+            },
+            getDuration: async () => {
+              const s = await p.getState?.()
+              return Number((s as any)?.videoDuration) || 0
+            },
+          })
+
+          const safeOn = (eventName: string, handler: (data?: unknown) => void) => {
+            try { p.on(eventName, handler) } catch (e) { console.warn(`Failed to register ${eventName} handler:`, e) }
+          }
+
+          // イベント名バリエーション対応
+          const EV = {
+            DUR: ["video_durationchange", "VIDEO_DURATIONCHANGE", "durationchange"],
+            START: ["video_start", "VIDEO_START", "start"],
+            AD_S: ["ad_start", "AD_START"],
+            AD_E: ["ad_end", "AD_END"],
+            TIME: ["video_timechange", "VIDEO_TIMECHANGE", "timechange", "timeupdate"], // timeupdate を追加
+            ERR: ["error", "ERROR"],
+          }
+
+          // Duration
+          EV.DUR.forEach((name) => safeOn(name, () => {
+            p.getState?.().then((s) => {
+              const d = Number((s as any)?.videoDuration) || 0
+              if (d > 0) handlersRef.current.onDuration?.(d)
+            }).catch(() => {})
+          }))
+
+          // Start
+          EV.START.forEach((name) => safeOn(name, () => {
+            handlersRef.current.onReady?.()
+            p.getState?.().then((s) => {
+              const d = Number((s as any)?.videoDuration) || 0
+              if (d > 0) handlersRef.current.onDuration?.(d)
+            }).catch(() => {})
+          }))
+
+          // Ads
+          EV.AD_S.forEach((name) => safeOn(name, () => (inAdRef.current = true)))
+          EV.AD_E.forEach((name) => safeOn(name, () => (inAdRef.current = false)))
+
+          // Time change（AB制御本体）
+          EV.TIME.forEach((name) => safeOn(name, (payload) => {
+            lastEventAtRef.current = performance.now()
+            const t = extractTime(payload)
+            handlersRef.current.onProgress?.(t)
+            maybeLoop(t, p)
+          }))
+
+          // Error
+          EV.ERR.forEach((name) => safeOn(name, handlersRef.current.onError))
+
+          // フォールバック開始
+          startRaf()
+
+          // cleanup
+          const cleanup = () => {
+            try { registerApi?.(null) } catch {}
+            try { p.destroy?.() } catch {}
+            stopRaf()
+            cleanupWarn()
+            playerRef.current = null
+            initializedRef.current = false
+          }
+          ;(playerRef.current as any).__dm_cleanup__ = cleanup
+        })
+        .catch((err) => handlersRef.current.onError?.(err))
     }
 
     if (existing) {
-      ensurePlayer()
+      if (!playerRef.current) ensurePlayer()
     } else {
       const s = document.createElement("script")
       s.src = sdkSrc
       s.async = true
       s.onload = ensurePlayer
-      s.onerror = () => onError(new Error('Failed to load Dailymotion SDK'))
+      s.onerror = () => handlersRef.current.onError?.(new Error("Failed to load Dailymotion SDK"))
       document.head.appendChild(s)
     }
 
     return () => {
-      try {
-        const p = playerRef.current as {
-          destroy?: () => void;
-        } | null
-        if (p?.destroy) p.destroy()
-        playerRef.current = null
-      } catch {
-        // エラーを無視
-      }
+      try { playerRef.current?.__dm_cleanup__?.() } catch {}
+      registerApi?.(null)
     }
-  }, [videoId, playerId, settings.a, settings.b, settings.loopMode, onReady, onDuration, onProgress, onError])
+  }, [videoId, playerId, registerApi, maybeLoop, startRaf, stopRaf])
 
-  // 再生制御
+  // 音量のみ反映（速度はDMの制約上ここでは未対応）
   useEffect(() => {
-    const p = playerRef.current as {
-      setVolume?: (volume: number) => Promise<void>;
-    } | null
-    if (!p) return
-
-    // ボリューム制御
-    if (typeof settings.volume === 'number' && p.setVolume) {
-      p.setVolume(settings.volume).catch(console.error)
-    }
-
-    // 再生速度制御（Dailymotionでは制限あり）
-    if (typeof settings.rate === 'number' && settings.rate !== 1) {
-      // Dailymotionは再生速度変更に制限があるため、警告のみ
-      console.warn('Dailymotion does not support playback rate control')
-    }
-  }, [settings.volume, settings.rate])
+    const p = playerRef.current as { setVolume?: (v: number) => Promise<void> } | null
+    if (!p || typeof settings.volume !== "number" || !p.setVolume) return
+    p.setVolume(settings.volume).catch(() => {})
+  }, [settings.volume])
 
   return (
     <div className="relative">
@@ -217,15 +385,19 @@ const DailymotionABPlayer = ({
   )
 }
 
+
+/* ========================
+   親: VideoPlayer
+======================== */
 export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
   const searchParams = useSearchParams()
   const playerRef = useRef<ReactPlayer>(null)
+  const dmApiRef = useRef<DMExternalApi | null>(null)
 
   const [url, setUrl] = useState(initialUrl || "")
-  
-  // Dailymotion判定
   const isDM = isDailymotionUrl(url)
   const dmId = isDM ? extractDailymotionVideoId(url) : null
+
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
@@ -233,36 +405,43 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
   const [error, setError] = useState<PlayerError | null>(null)
   const [settings, setSettings] = useState<ABSettings>({
     loopMode: "off",
-    loopCount: 1,
+    loopCount: 3,
     rate: 1,
     volume: 0.8,
-    // A点とB点の初期値を設定（後でdurationが取得できたら更新）
     a: 0,
-    b: undefined, // durationが分かるまでは未設定
+    b: undefined,
   })
-  const [isDragging, setIsDragging] = useState(false)
-  const [dragTarget, setDragTarget] = useState<'a' | 'b' | null>(null)
+  const [isDragging] = useState(false)
 
-  // Update URL when initialUrl changes (realtime reflection)
+  // 親から渡すハンドラは useCallback で安定化
+  const handleDMSettingsChange = useCallback(
+    (ns: Partial<ABSettings>) => setSettings((prev) => ({ ...prev, ...ns })),
+    []
+  )
+  const handleDMReady = useCallback(() => setIsReady(true), [])
+  const handleDMRegisterApi = useCallback((api: DMExternalApi | null) => {
+    dmApiRef.current = api
+  }, [])
+  const handleDMLoop = useCallback(() => {
+    setSettings((prev) => {
+      if (prev.loopMode !== "finite" || prev.loopCount <= 0) return prev
+      const left = prev.loopCount - 1
+      return left > 0 ? { ...prev, loopCount: left } : { ...prev, loopMode: "off", loopCount: 0 }
+    })
+  }, [])
+
+  /* URL初期化/変更 */
   useEffect(() => {
     if (initialUrl !== undefined) {
-      const normalizedUrl = isDailymotionUrl(initialUrl) 
-        ? normalizeDailymotionUrl(initialUrl) 
-        : initialUrl
+      const normalizedUrl = isDailymotionUrl(initialUrl) ? normalizeDailymotionUrl(initialUrl) : initialUrl
       setUrl(normalizedUrl)
       setError(null)
       setIsReady(false)
-      // URL変更時にAB値をリセット
-      setSettings(prev => ({
-        ...prev,
-        a: 0,
-        b: undefined
-      }))
+      setSettings((prev) => ({ ...prev, a: 0, b: undefined }))
     }
   }, [initialUrl])
 
-
-  // Initialize from URL params (for direct /player page access)
+  /* URLパラメータから初期設定 */
   useEffect(() => {
     const src = searchParams.get("src")
     const a = searchParams.get("a")
@@ -271,9 +450,7 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
     const rate = searchParams.get("rate")
 
     if (src && !initialUrl) {
-      const normalizedUrl = isDailymotionUrl(src) 
-        ? normalizeDailymotionUrl(src) 
-        : src
+      const normalizedUrl = isDailymotionUrl(src) ? normalizeDailymotionUrl(src) : src
       setUrl(normalizedUrl)
       setError(null)
       setIsReady(false)
@@ -281,29 +458,40 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
     if (a || b || loop || rate) {
       setSettings((prev) => ({
         ...prev,
-        a: a ? Number.parseFloat(a) : 0, // デフォルトは0秒
-        b: b ? Number.parseFloat(b) : undefined, // デフォルトは動画の最後（durationで設定）
+        a: a ? Number.parseFloat(a) : 0,
+        b: b ? Number.parseFloat(b) : undefined,
         loopMode: loop === "inf" ? "infinite" : loop === "off" ? "off" : "finite",
         rate: rate ? Number.parseFloat(rate) : 1,
       }))
     }
   }, [searchParams, initialUrl])
 
-
-  // AB Loop logic
+  /* ABループ（ReactPlayer側） */
   useEffect(() => {
-    if (settings.loopMode !== "off" && settings.a !== undefined && settings.b !== undefined) {
-      if (currentTime >= settings.b) {
-        playerRef.current?.seekTo(settings.a, "seconds")
+    if (isDM) return
+    const A = settings.a
+    const B = settings.b
+    if (settings.loopMode === "off" || A === undefined || B === undefined) return
+    if (currentTime >= B) {
+      if (settings.loopMode === "infinite") {
+        playerRef.current?.seekTo(A, "seconds")
+      } else if (settings.loopMode === "finite") {
+        setSettings((prev) => {
+          const left = Math.max(0, prev.loopCount - 1)
+          if (left > 0) {
+            playerRef.current?.seekTo(A, "seconds")
+            return { ...prev, loopCount: left }
+          }
+          return { ...prev, loopMode: "off", loopCount: 0 }
+        })
       }
     }
-  }, [currentTime, settings])
+  }, [currentTime, settings, isDM])
 
-  // Keyboard shortcuts
+  /* キーボードショートカット */
   useEffect(() => {
     const handleKeyPress = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement) return
-
       switch (e.key) {
         case "[":
           setSettings((prev) => ({ ...prev, a: currentTime }))
@@ -312,55 +500,45 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
           setSettings((prev) => ({ ...prev, b: currentTime }))
           break
         case "\\":
-          setSettings((prev) => ({
-            ...prev,
-            loopMode: prev.loopMode === "off" ? "infinite" : "off",
-          }))
+          setSettings((prev) => ({ ...prev, loopMode: prev.loopMode === "off" ? "infinite" : "off" }))
           break
         case " ":
           e.preventDefault()
-          setPlaying((prev) => !prev)
+          togglePlay()
           break
       }
     }
-
     window.addEventListener("keydown", handleKeyPress)
     return () => window.removeEventListener("keydown", handleKeyPress)
-  }, [currentTime])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentTime, isDM, playing])
 
-  const handleProgress = useCallback((state: { playedSeconds: number }) => {
-    if (!isDragging) setCurrentTime(state.playedSeconds)
-  }, [isDragging])
+  /* 共通ハンドラ（ReactPlayer向け） */
+  const handleProgress = useCallback(
+    (state: { playedSeconds: number }) => {
+      if (!isDragging) setCurrentTime(state.playedSeconds)
+    },
+    [isDragging]
+  )
 
-  const handleDuration = useCallback((duration: number) => {
-    setDuration(duration)
-    // durationが取得できたら、B点をデフォルトで動画の最後に設定
-    setSettings(prev => ({
-      ...prev,
-      b: prev.b !== undefined ? prev.b : duration // URLパラメータでB点が指定されていない場合のみ設定
-    }))
+  const handleDuration = useCallback((d: number) => {
+    setDuration(d)
+    setSettings((prev) => ({ ...prev, b: prev.b !== undefined ? prev.b : d }))
   }, [])
 
   const handleReady = useCallback(() => {
     setIsReady(true)
     setError(null)
-    setPlaying(false)
-
-    // YouTube の 0秒問題対策: ready後に getDuration を再取得
+    // ReactPlayer の duration を取り直し（0秒対策）
     const trySet = () => {
       const d = playerRef.current?.getDuration?.()
-      if (typeof d === 'number' && isFinite(d) && d > 0) {
+      if (typeof d === "number" && isFinite(d) && d > 0) {
         setDuration(d)
-        // durationが取得できたら、B点をデフォルトで動画の最後に設定
-        setSettings(prev => ({
-          ...prev,
-          b: prev.b !== undefined ? prev.b : d // URLパラメータでB点が指定されていない場合のみ設定
-        }))
+        setSettings((prev) => ({ ...prev, b: prev.b !== undefined ? prev.b : d }))
         return true
       }
       return false
     }
-
     if (!trySet()) {
       const id = setInterval(() => {
         if (trySet()) clearInterval(id)
@@ -369,56 +547,44 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
     }
   }, [])
 
-  const handleError = useCallback((error: unknown) => {
-    // 完全に空のオブジェクトのみスキップ
-    if (!error || (typeof error === 'object' && Object.keys(error).length === 0)) {
-      return
-    }
-
-    console.error('ReactPlayer error:', error)
-    
-    // HTML5 Errorイベントからメディアエラーの詳細を取得
-    let errorMessage = 'Failed to load video.'
-    
-    if (error.target && error.target.error) {
-      const mediaError = error.target.error
-      switch (mediaError.code) {
-        case 1: // MEDIA_ERR_ABORTED
-          errorMessage = 'Video loading was interrupted.'
-          break
-        case 2: // MEDIA_ERR_NETWORK
-          errorMessage = 'Network error. Please check your connection.'
-          break
-        case 3: // MEDIA_ERR_DECODE
-          errorMessage = 'Video format is corrupted.'
-          break
-        case 4: // MEDIA_ERR_SRC_NOT_SUPPORTED
-          // Dailymotion特有のエラーメッセージ
-          if (isDailymotionUrl(url)) {
-            errorMessage = 'Cannot load Dailymotion video. It may not be embeddable.'
-          } else {
-            errorMessage = 'This video format is not supported.'
-          }
-          break
-        default:
-          errorMessage = 'Please check if the URL is correct.'
+  const handleError = useCallback(
+    (error: any) => {
+      if (!error || (typeof error === "object" && Object.keys(error).length === 0)) return
+      console.error("Player error:", error)
+      let errorMessage = "Failed to load video."
+      if (error?.target?.error) {
+        const mediaError = error.target.error
+        switch (mediaError.code) {
+          case 1:
+            errorMessage = "Video loading was interrupted."
+            break
+          case 2:
+            errorMessage = "Network error. Please check your connection."
+            break
+          case 3:
+            errorMessage = "Video format is corrupted."
+            break
+          case 4:
+            errorMessage = isDailymotionUrl(url)
+              ? "Cannot load Dailymotion video. It may not be embeddable."
+              : "This video format is not supported."
+            break
+          default:
+            errorMessage = "Please check if the URL is correct."
+        }
+      } else if (isDailymotionUrl(url)) {
+        errorMessage = "Cannot access Dailymotion video. Please check the URL or try another video."
       }
-    } else if (isDailymotionUrl(url)) {
-      // Dailymotion特有の問題
-      errorMessage = 'Cannot access Dailymotion video. Please check the URL format or try a different video.'
-    }
-    
-    setError({
-      message: errorMessage,
-      type: 'loading_error'
-    })
-    setIsReady(false)
-  }, [url])
+      setError({ message: errorMessage, type: "loading_error" })
+      setIsReady(false)
+    },
+    [url]
+  )
 
-  const isValidUrl = (url: string) => {
-    if (!url) return false
+  const isValidUrl = (u: string) => {
+    if (!u) return false
     try {
-      new URL(url)
+      new URL(u)
       return true
     } catch {
       return false
@@ -430,9 +596,10 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
     const secs = Math.floor(seconds % 60)
     return `${mins}:${secs.toString().padStart(2, "0")}`
   }
+
   const parseTime = (timeString: string) => {
     if (!timeString) return 0
-    const parts = timeString.split(':')
+    const parts = timeString.split(":")
     if (parts.length === 2) {
       const mins = parseInt(parts[0]) || 0
       const secs = parseInt(parts[1]) || 0
@@ -448,57 +615,38 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
     if (settings.b !== undefined) params.set("b", settings.b.toString())
     if (settings.loopMode !== "off") params.set("loop", settings.loopMode === "infinite" ? "inf" : "finite")
     if (settings.rate !== 1) params.set("rate", settings.rate.toString())
-
     const shareUrl = `${window.location.origin}/player?${params.toString()}`
     navigator.clipboard.writeText(shareUrl)
   }
 
+  /* ===== Dailymotion対応：UI→プレイヤー制御の分岐 ===== */
+  const togglePlay = () => {
+    if (isDM) {
+      if (playing) dmApiRef.current?.pause()
+      else dmApiRef.current?.play()
+      setPlaying(!playing)
+    } else {
+      setPlaying(!playing)
+    }
+  }
 
   const handleProgressBarClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!duration) return
+    if (!isReady || !duration) return
     const rect = e.currentTarget.getBoundingClientRect()
     const newTime = ((e.clientX - rect.left) / rect.width) * duration
-    playerRef.current?.seekTo(newTime, "seconds")
+    if (isDM) dmApiRef.current?.seekTo(newTime)
+    else playerRef.current?.seekTo(newTime, "seconds")
   }
 
-  const handleMarkerDrag = (e: React.MouseEvent<HTMLDivElement>, marker: 'a' | 'b') => {
-    e.preventDefault()
-    setIsDragging(true)
-    setDragTarget(marker)
+  const handleLoop = handleDMLoop
 
-    const handleMouseMove = (moveEvent: MouseEvent) => {
-      const progressBar = (moveEvent.target as HTMLElement).closest('.progress-bar')
-      if (!progressBar || !duration) return
-
-      const rect = progressBar.getBoundingClientRect()
-      const x = moveEvent.clientX - rect.left
-      const percentage = Math.max(0, Math.min(1, x / rect.width))
-      const newTime = percentage * duration
-
-      setSettings((prev) => ({
-        ...prev,
-        [marker]: newTime,
-      }))
-    }
-
-    const handleMouseUp = () => {
-      setIsDragging(false)
-      setDragTarget(null)
-      document.removeEventListener('mousemove', handleMouseMove)
-      document.removeEventListener('mouseup', handleMouseUp)
-    }
-
-    document.addEventListener('mousemove', handleMouseMove)
-    document.addEventListener('mouseup', handleMouseUp)
-  }
-
+  /* ========= UI ========= */
   return (
     <div className="min-h-[50vh] bg-background p-4">
       <div className="max-w-7xl mx-auto space-y-6">
-        {/* Video Player - Show placeholder when no URL */}
         {url && isValidUrl(url) ? (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Left Column - Video */}
+            {/* Left: Player */}
             <div className="space-y-4">
               {error ? (
                 <div className="flex items-center justify-center bg-muted rounded-lg" style={{ aspectRatio: "16/9" }}>
@@ -506,12 +654,12 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                     <Play className="h-12 w-12 mx-auto opacity-50 mb-4" />
                     <p className="text-lg font-medium mb-2">Video Loading Error</p>
                     <p className="text-sm">{error.message}</p>
-                    <Button 
+                    <Button
                       onClick={() => {
                         setError(null)
                         setIsReady(false)
-                      }} 
-                      variant="outline" 
+                      }}
+                      variant="outline"
                       className="mt-4 cursor-pointer"
                     >
                       Retry
@@ -524,11 +672,13 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                     <DailymotionABPlayer
                       videoId={dmId}
                       settings={settings}
-                      onSettingsChange={(newSettings) => setSettings(prev => ({ ...prev, ...newSettings }))}
+                      onSettingsChange={handleDMSettingsChange}
                       onProgress={setCurrentTime}
                       onDuration={handleDuration}
-                      onReady={handleReady}
+                      onReady={handleDMReady}
                       onError={handleError}
+                      registerApi={handleDMRegisterApi}
+                      onLoop={handleLoop}
                     />
                   ) : (
                     <>
@@ -558,126 +708,109 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                 </div>
               )}
 
-              {/* Custom Controls */}
-              {isReady && (
-                <div className="space-y-4">
-                  {/* Progress Bar with AB markers */}
-                  <div className="relative cursor-pointer">
-                    <div 
-                      className="progress-bar w-full h-2 bg-muted rounded-full relative cursor-pointer"
-                      onClick={handleProgressBarClick}
-                    >
-                      {/* Progress */}
-                      <div 
-                        className="absolute top-0 left-0 h-full bg-primary rounded-full transition-all"
-                        style={{ width: `${(currentTime / duration) * 100}%` }}
+              {/* Progress + AB markers */}
+              <div className={`space-y-4 ${!isReady ? "opacity-60 pointer-events-none" : ""}`}>
+                <div className="relative cursor-pointer">
+                  <div
+                    className="progress-bar w-full h-2 bg-muted rounded-full relative cursor-pointer"
+                    onClick={handleProgressBarClick}
+                  >
+                    <div
+                      className="absolute top-0 left-0 h-full bg-primary rounded-full transition-all"
+                      style={{ width: `${(currentTime / duration) * 100 || 0}%` }}
+                    />
+                    {settings.a !== undefined && duration > 0 && (
+                      <div
+                        className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-green-500 border-2 border-white rounded-full shadow-lg"
+                        style={{
+                          left: `${(settings.a / duration) * 100}%`,
+                          transform: "translateX(-50%) translateY(-50%)",
+                        }}
+                        title={`Start: ${formatTime(settings.a)}`}
                       />
-                      
-                      {/* A Marker */}
-                      {settings.a !== undefined && (
-                        <div
-                          className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-green-500 border-2 border-white rounded-full cursor-grab active:cursor-grabbing shadow-lg"
-                          style={{ left: `${(settings.a / duration) * 100}%`, transform: 'translateX(-50%) translateY(-50%)' }}
-                          onMouseDown={(e) => handleMarkerDrag(e, 'a')}
-                          title={`Start: ${formatTime(settings.a)}`}
-                        />
-                      )}
-                      
-                      {/* B Marker */}
-                      {settings.b !== undefined && (
-                        <div
-                          className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-red-500 border-2 border-white rounded-full cursor-grab active:cursor-grabbing shadow-lg"
-                          style={{ left: `${(settings.b / duration) * 100}%`, transform: 'translateX(-50%) translateY(-50%)' }}
-                          onMouseDown={(e) => handleMarkerDrag(e, 'b')}
-                          title={`End: ${formatTime(settings.b)}`}
-                        />
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Time Display */}
-                  <div className="flex justify-between text-sm text-muted-foreground">
-                    <span>{formatTime(currentTime)}</span>
-                    <span>{formatTime(duration)}</span>
-                  </div>
-
-                  {/* Control Buttons */}
-                  <div className="flex justify-center gap-2">
-                    {/* A Point Button */}
-                    <Button
-                      size="lg"
-                      variant="outline"
-                      onClick={() => setSettings(prev => ({ ...prev, a: currentTime }))}
-                      disabled={!isReady}
-                      className={`cursor-pointer transition-all duration-200 ${
-                        settings.a !== undefined 
-                          ? "bg-green-600 text-white border-green-600 hover:bg-green-700 shadow-md" 
-                          : "bg-transparent text-green-600 border-green-600 hover:bg-green-50"
-                      }`}
-                      title={`Set start point (current: ${settings.a !== undefined ? formatTime(settings.a) : 'not set'})`}
-                    >
-                      <Bookmark className="h-5 w-5" />
-                      <span className="ml-1 font-bold">A</span>
-                    </Button>
-
-                    {/* Play/Pause Button */}
-                    <Button
-                      size="lg"
-                      variant="outline"
-                      onClick={() => setPlaying(!playing)}
-                      className="cursor-pointer"
-                    >
-                      {playing ? (
-                        <Pause className="h-6 w-6" />
-                      ) : (
-                        <Play className="h-6 w-6" />
-                      )}
-                    </Button>
-
-                    {/* B Point Button */}
-                    <Button
-                      size="lg"
-                      variant="outline"
-                      onClick={() => setSettings(prev => ({ ...prev, b: currentTime }))}
-                      disabled={!isReady}
-                      className={`cursor-pointer transition-all duration-200 ${
-                        settings.b !== undefined 
-                          ? "bg-red-600 text-white border-red-600 hover:bg-red-700 shadow-md" 
-                          : "bg-transparent text-red-600 border-red-600 hover:bg-red-50"
-                      }`}
-                      title={`Set end point (current: ${settings.b !== undefined ? formatTime(settings.b) : 'not set'})`}
-                    >
-                      <Bookmark className="h-5 w-5" />
-                      <span className="ml-1 font-bold">B</span>
-                    </Button>
-
-                    {/* Loop Button */}
-                    <Button
-                      size="lg"
-                      variant="outline"
-                      onClick={() => setSettings(prev => ({ 
-                        ...prev, 
-                        loopMode: prev.loopMode === "off" ? "infinite" : "off" 
-                      }))}
-                      disabled={!isReady}
-                      className={`cursor-pointer transition-all duration-200 ${
-                        settings.loopMode !== "off" 
-                          ? "bg-blue-600 text-white border-blue-600 hover:bg-blue-700 shadow-md" 
-                          : "bg-transparent text-gray-400 border-gray-300 hover:bg-gray-50 hover:text-gray-600"
-                      }`}
-                      title={`Toggle loop (currently: ${settings.loopMode})`}
-                    >
-                      <Repeat className="h-6 w-6" />
-                      <span className="ml-1 text-xs font-medium">
-                        {settings.loopMode !== "off" ? "ON" : "OFF"}
-                      </span>
-                    </Button>
+                    )}
+                    {settings.b !== undefined && duration > 0 && (
+                      <div
+                        className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-red-500 border-2 border-white rounded-full shadow-lg"
+                        style={{
+                          left: `${(settings.b / duration) * 100}%`,
+                          transform: "translateX(-50%) translateY(-50%)",
+                        }}
+                        title={`End: ${formatTime(settings.b)}`}
+                      />
+                    )}
                   </div>
                 </div>
-              )}
+
+                {/* Time */}
+                <div className="flex justify-between text-sm text-muted-foreground">
+                  <span>{formatTime(currentTime)}</span>
+                  <span>{formatTime(duration)}</span>
+                </div>
+
+                {/* Controls */}
+                <div className="flex justify-center gap-2">
+                  <Button
+                    size="lg"
+                    variant="outline"
+                    onClick={() => setSettings((prev) => ({ ...prev, a: currentTime }))}
+                    disabled={!isReady}
+                    className={`cursor-pointer transition-all duration-200 ${
+                      settings.a !== undefined
+                        ? "bg-green-600 text-white border-green-600 hover:bg-green-700 shadow-md"
+                        : "bg-transparent text-green-600 border-green-600 hover:bg-green-50"
+                    }`}
+                    title={`Set start point (current: ${settings.a !== undefined ? formatTime(settings.a) : "not set"})`}
+                  >
+                    <Bookmark className="h-5 w-5" />
+                    <span className="ml-1 font-bold">A</span>
+                  </Button>
+
+                  <Button size="lg" variant="outline" onClick={togglePlay} className="cursor-pointer" disabled={!isReady}>
+                    {playing ? <Pause className="h-6 w-6" /> : <Play className="h-6 w-6" />}
+                  </Button>
+
+                  <Button
+                    size="lg"
+                    variant="outline"
+                    onClick={() => setSettings((prev) => ({ ...prev, b: currentTime }))}
+                    disabled={!isReady}
+                    className={`cursor-pointer transition-all duration-200 ${
+                      settings.b !== undefined
+                        ? "bg-red-600 text-white border-red-600 hover:bg-red-700 shadow-md"
+                        : "bg-transparent text-red-600 border-red-600 hover:bg-red-50"
+                    }`}
+                    title={`Set end point (current: ${settings.b !== undefined ? formatTime(settings.b) : "not set"})`}
+                  >
+                    <Bookmark className="h-5 w-5" />
+                    <span className="ml-1 font-bold">B</span>
+                  </Button>
+
+                  <Button
+                    size="lg"
+                    variant="outline"
+                    onClick={() =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        loopMode: prev.loopMode === "off" ? "infinite" : "off",
+                      }))
+                    }
+                    disabled={!isReady}
+                    className={`cursor-pointer transition-all duration-200 ${
+                      settings.loopMode !== "off"
+                        ? "bg-blue-600 text-white border-blue-600 hover:bg-blue-700 shadow-md"
+                        : "bg-transparent text-gray-400 border-gray-300 hover:bg-gray-50 hover:text-gray-600"
+                    }`}
+                    title={`Toggle loop (currently: ${settings.loopMode})`}
+                  >
+                    <Repeat className="h-6 w-6" />
+                    <span className="ml-1 text-xs font-medium">{settings.loopMode !== "off" ? "ON" : "OFF"}</span>
+                  </Button>
+                </div>
+              </div>
             </div>
 
-            {/* Right Column - Settings */}
+            {/* Right: Settings */}
             <div className="space-y-6">
               <Card>
                 <CardHeader>
@@ -687,7 +820,7 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  {/* A Point */}
+                  {/* A */}
                   <div className="space-y-2">
                     <Label htmlFor="a-point">Loop Start</Label>
                     <div className="flex gap-2">
@@ -698,30 +831,24 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                         value={settings.a !== undefined ? formatTime(settings.a) : ""}
                         onChange={(e) => {
                           const timeValue = parseTime(e.target.value)
-                          setSettings(prev => ({ 
-                            ...prev, 
-                            a: timeValue
-                          }))
+                          setSettings((prev) => ({ ...prev, a: timeValue }))
                         }}
                         disabled={!isReady}
                         className="cursor-text"
                       />
-                      <Button 
-                        variant="outline" 
+                      <Button
+                        variant="outline"
                         size="sm"
-                        onClick={() => setSettings(prev => ({ ...prev, a: currentTime }))}
+                        onClick={() => setSettings((prev) => ({ ...prev, a: currentTime }))}
                         disabled={!isReady}
                         className="cursor-pointer"
                       >
                         Current
                       </Button>
                     </div>
-                    <p className="text-xs text-muted-foreground">
-                      {settings.a !== undefined ? formatTime(settings.a) : "Not Set"}
-                    </p>
                   </div>
 
-                  {/* B Point */}
+                  {/* B */}
                   <div className="space-y-2">
                     <Label htmlFor="b-point">Loop End</Label>
                     <div className="flex gap-2">
@@ -732,48 +859,69 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                         value={settings.b !== undefined ? formatTime(settings.b) : ""}
                         onChange={(e) => {
                           const timeValue = parseTime(e.target.value)
-                          setSettings(prev => ({ 
-                            ...prev, 
-                            b: timeValue
-                          }))
+                          setSettings((prev) => ({ ...prev, b: timeValue }))
                         }}
                         disabled={!isReady}
                         className="cursor-text"
                       />
-                      <Button 
-                        variant="outline" 
+                      <Button
+                        variant="outline"
                         size="sm"
-                        onClick={() => setSettings(prev => ({ ...prev, b: currentTime }))}
+                        onClick={() => setSettings((prev) => ({ ...prev, b: currentTime }))}
                         disabled={!isReady}
                         className="cursor-pointer"
                       >
                         Current
                       </Button>
                     </div>
-                    <p className="text-xs text-muted-foreground">
-                      {settings.b !== undefined ? formatTime(settings.b) : "Not Set"}
-                    </p>
                   </div>
 
-                  {/* Loop Mode */}
+                  {/* Loop Mode + Count */}
                   <div className="space-y-2">
                     <Label>Loop Mode</Label>
-                    <RadioGroup 
-                      value={settings.loopMode} 
-                      onValueChange={(value: "off" | "infinite" | "finite") => 
-                        setSettings(prev => ({ ...prev, loopMode: value }))
+                    <RadioGroup
+                      value={settings.loopMode}
+                      onValueChange={(value: "off" | "infinite" | "finite") =>
+                        setSettings((prev) => ({ ...prev, loopMode: value }))
                       }
                       className="cursor-pointer"
                     >
                       <div className="flex items-center space-x-2 cursor-pointer">
                         <RadioGroupItem value="off" id="off" className="cursor-pointer" />
-                        <Label htmlFor="off" className="cursor-pointer">Off</Label>
+                        <Label htmlFor="off" className="cursor-pointer">
+                          Off
+                        </Label>
                       </div>
                       <div className="flex items-center space-x-2 cursor-pointer">
                         <RadioGroupItem value="infinite" id="infinite" className="cursor-pointer" />
-                        <Label htmlFor="infinite" className="cursor-pointer">Infinite Loop</Label>
+                        <Label htmlFor="infinite" className="cursor-pointer">
+                          Infinite Loop
+                        </Label>
+                      </div>
+                      <div className="flex items-center space-x-2 cursor-pointer">
+                        <RadioGroupItem value="finite" id="finite" className="cursor-pointer" />
+                        <Label htmlFor="finite" className="cursor-pointer">
+                          Finite (with count)
+                        </Label>
                       </div>
                     </RadioGroup>
+
+                    {settings.loopMode === "finite" && (
+                      <div className="space-y-2">
+                        <Label htmlFor="loopcount">Loop Count (remaining)</Label>
+                        <Slider
+                          id="loopcount"
+                          min={1}
+                          max={20}
+                          step={1}
+                          value={[Math.max(0, settings.loopCount)]}
+                          onValueChange={([v]) => setSettings((prev) => ({ ...prev, loopCount: v }))}
+                          disabled={!isReady}
+                          className="cursor-pointer"
+                        />
+                        <div className="text-xs text-muted-foreground">{Math.max(0, settings.loopCount)} time(s)</div>
+                      </div>
+                    )}
                   </div>
 
                   {/* Playback Rate */}
@@ -785,8 +933,8 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                       max={2}
                       step={0.25}
                       value={[settings.rate]}
-                      onValueChange={([value]) => setSettings(prev => ({ ...prev, rate: value }))}
-                      disabled={!isReady}
+                      onValueChange={([value]) => setSettings((prev) => ({ ...prev, rate: value }))}
+                      disabled={!isReady || isDM} // Dailymotionは制限あり
                       className="cursor-pointer"
                     />
                   </div>
@@ -800,25 +948,21 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                       max={1}
                       step={0.1}
                       value={[settings.volume]}
-                      onValueChange={([value]) => setSettings(prev => ({ ...prev, volume: value }))}
+                      onValueChange={([value]) => setSettings((prev) => ({ ...prev, volume: value }))}
                       disabled={!isReady}
                       className="cursor-pointer"
                     />
                   </div>
 
-                  {/* Share Button */}
-                  <Button 
-                    onClick={generateShareUrl}
-                    disabled={!isReady}
-                    className="w-full cursor-pointer"
-                  >
+                  {/* Share */}
+                  <Button onClick={generateShareUrl} disabled={!isReady} className="w-full cursor-pointer">
                     <Share2 className="h-4 w-4 mr-2" />
                     Copy Share Link
                   </Button>
                 </CardContent>
               </Card>
 
-              {/* Instructions */}
+              {/* Shortcuts */}
               <Card>
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
@@ -828,15 +972,15 @@ export function VideoPlayer({ initialUrl }: VideoPlayerProps = {}) {
                 </CardHeader>
                 <CardContent className="space-y-2 text-sm">
                   <div className="flex justify-between">
-                    <span>[ キー</span>
+                    <span>[</span>
                     <span>Set Start Point</span>
                   </div>
                   <div className="flex justify-between">
-                    <span>] キー</span>
+                    <span>]</span>
                     <span>Set End Point</span>
                   </div>
                   <div className="flex justify-between">
-                    <span>\ キー</span>
+                    <span>\</span>
                     <span>Toggle Loop</span>
                   </div>
                   <div className="flex justify-between">
