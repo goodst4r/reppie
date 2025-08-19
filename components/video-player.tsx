@@ -89,7 +89,7 @@ const DailymotionABPlayer = ({
 
     const ensurePlayer = () => {
       const dm = (window as { dailymotion?: unknown }).dailymotion as {
-        createPlayer: (container: HTMLElement, config: {
+        createPlayer: (containerSelector: string, config: {
           video: string;
           params: Record<string, unknown>;
         }) => Promise<{
@@ -102,7 +102,13 @@ const DailymotionABPlayer = ({
       }
       if (!dm || !containerRef.current) return
 
-      dm.createPlayer(containerRef.current, {
+      // コンテナにIDを設定してセレクタで指定
+      const containerId = `dailymotion-player-${videoId}`
+      if (containerRef.current) {
+        containerRef.current.id = containerId
+      }
+
+      dm.createPlayer(`#${containerId}`, {
         video: videoId,
         params: { 
           startTime: 0, 
